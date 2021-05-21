@@ -15,7 +15,6 @@
 package arp_test
 
 import (
-	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -24,6 +23,7 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip/faketime"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 	"gvisor.dev/gvisor/pkg/tcpip/link/sniffer"
@@ -123,22 +123,17 @@ func (d *arpDispatcher) OnNeighborRemoved(nicID tcpip.NICID, entry stack.Neighbo
 	d.C <- e
 }
 
-func (d *arpDispatcher) waitForEvent(ctx context.Context, want eventInfo) error {
+func (d *arpDispatcher) waitForEventWithTimeout(clock *faketime.ManualClock, want eventInfo, timeout time.Duration) error {
+	clock.Advance(timeout)
 	select {
 	case got := <-d.C:
-		if diff := cmp.Diff(want, got, cmp.AllowUnexported(got), cmpopts.IgnoreFields(stack.NeighborEntry{}, "UpdatedAtNanos")); diff != "" {
+		if diff := cmp.Diff(want, got, cmp.AllowUnexported(got), cmpopts.IgnoreFields(stack.NeighborEntry{}, "UpdatedAt")); diff != "" {
 			return fmt.Errorf("got invalid event (-want +got):\n%s", diff)
 		}
-	case <-ctx.Done():
-		return fmt.Errorf("%s for %s", ctx.Err(), want)
+		return nil
+	default:
+		return fmt.Errorf("event didn't arrive after %s", timeout)
 	}
-	return nil
-}
-
-func (d *arpDispatcher) waitForEventWithTimeout(want eventInfo, timeout time.Duration) error {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	return d.waitForEvent(ctx, want)
 }
 
 func (d *arpDispatcher) nextEvent() (eventInfo, bool) {
@@ -153,6 +148,7 @@ func (d *arpDispatcher) nextEvent() (eventInfo, bool) {
 type testContext struct {
 	s       *stack.Stack
 	linkEP  *channel.Endpoint
+	clock   *faketime.ManualClock
 	nudDisp *arpDispatcher
 }
 
@@ -169,11 +165,13 @@ func newTestContext(t *testing.T) *testContext {
 		C: make(chan eventInfo, eventChanSize),
 	}
 
+	clock := faketime.NewManualClock()
 	s := stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, arp.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{icmp.NewProtocol4},
 		NUDConfigs:         c,
 		NUDDisp:            &d,
+		Clock:              clock,
 	})
 
 	ep := channel.New(defaultChannelSize, defaultMTU, stackLinkAddr)
@@ -200,6 +198,7 @@ func newTestContext(t *testing.T) *testContext {
 	return &testContext{
 		s:       s,
 		linkEP:  ep,
+		clock:   clock,
 		nudDisp: &d,
 	}
 }
@@ -400,7 +399,7 @@ func TestDirectRequest(t *testing.T) {
 					State:    stack.Stale,
 				},
 			}
-			if err := c.nudDisp.waitForEventWithTimeout(wantEvent, time.Second); err != nil {
+			if err := c.nudDisp.waitForEventWithTimeout(c.clock, wantEvent, time.Second); err != nil {
 				t.Fatal(err)
 			}
 
@@ -663,6 +662,7 @@ func TestLinkAddressRequest(t *testing.T) {
 }
 
 func TestDADARPRequestPacket(t *testing.T) {
+	clock := faketime.NewManualClock()
 	s := stack.New(stack.Options{
 		NetworkProtocols: []stack.NetworkProtocolFactory{arp.NewProtocolWithOptions(arp.Options{
 			DADConfigs: stack.DADConfigurations{
@@ -670,6 +670,7 @@ func TestDADARPRequestPacket(t *testing.T) {
 				RetransmitTimer:        time.Second,
 			},
 		}), ipv4.NewProtocol},
+		Clock: clock,
 	})
 	e := channel.New(1, defaultMTU, stackLinkAddr)
 	if err := s.CreateNIC(nicID, e); err != nil {
@@ -682,7 +683,8 @@ func TestDADARPRequestPacket(t *testing.T) {
 		t.Fatalf("got s.CheckDuplicateAddress(%d, %d, %s, _) = %d, want = %d", nicID, header.IPv4ProtocolNumber, remoteAddr, res, stack.DADStarting)
 	}
 
-	pkt, ok := e.ReadContext(context.Background())
+	clock.Advance(0)
+	pkt, ok := e.Read()
 	if !ok {
 		t.Fatal("expected to send an ARP request")
 	}

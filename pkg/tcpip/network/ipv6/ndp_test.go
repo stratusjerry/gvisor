@@ -16,7 +16,6 @@ package ipv6
 
 import (
 	"bytes"
-	"context"
 	"strings"
 	"testing"
 	"time"
@@ -399,8 +398,10 @@ func TestNeighborSolicitationResponse(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			clock := faketime.NewManualClock()
 			s := stack.New(stack.Options{
 				NetworkProtocols: []stack.NetworkProtocolFactory{NewProtocol},
+				Clock:            clock,
 			})
 			e := channel.New(1, 1280, nicLinkAddr)
 			e.LinkEPCapabilities |= stack.CapabilityResolutionRequired
@@ -470,7 +471,8 @@ func TestNeighborSolicitationResponse(t *testing.T) {
 			}
 
 			if test.performsLinkResolution {
-				p, got := e.ReadContext(context.Background())
+				clock.Advance(0)
+				p, got := e.Read()
 				if !got {
 					t.Fatal("expected an NDP NS response")
 				}
@@ -525,7 +527,8 @@ func TestNeighborSolicitationResponse(t *testing.T) {
 				}))
 			}
 
-			p, got := e.ReadContext(context.Background())
+			clock.Advance(0)
+			p, got := e.Read()
 			if !got {
 				t.Fatal("expected an NDP NA response")
 			}
@@ -1258,7 +1261,8 @@ func TestCheckDuplicateAddress(t *testing.T) {
 	snmc := header.SolicitedNodeAddr(lladdr0)
 	remoteLinkAddr := header.EthernetAddressFromMulticastIPv6Address(snmc)
 	checkDADMsg := func() {
-		p, ok := e.ReadContext(context.Background())
+		clock.Advance(0)
+		p, ok := e.Read()
 		if !ok {
 			t.Fatalf("expected %d-th DAD message", dadPacketsSent)
 		}

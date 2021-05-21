@@ -15,12 +15,89 @@
 package tcpip_test
 
 import (
+	"math"
 	"sync"
 	"testing"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
 )
+
+func TestMonotonicTimeBefore(t *testing.T) {
+	var mt tcpip.MonotonicTime
+	if mt.Before(mt) {
+		t.Errorf("%#v.Before(%#v)", mt, mt)
+	}
+
+	one := mt.Add(1)
+	if one.Before(mt) {
+		t.Errorf("%#v.Before(%#v)", one, mt)
+	}
+	if !mt.Before(one) {
+		t.Errorf("!%#v.Before(%#v)", mt, one)
+	}
+}
+
+func TestMonotonicTimeAfter(t *testing.T) {
+	var mt tcpip.MonotonicTime
+	if mt.After(mt) {
+		t.Errorf("%#v.After(%#v)", mt, mt)
+	}
+
+	one := mt.Add(1)
+	if mt.After(one) {
+		t.Errorf("%#v.After(%#v)", mt, one)
+	}
+	if !one.After(mt) {
+		t.Errorf("!%#v.After(%#v)", one, mt)
+	}
+}
+
+func TestMonotonicTimeAddSub(t *testing.T) {
+	var mt tcpip.MonotonicTime
+	if one, two := mt.Add(2), mt.Add(1).Add(1); one != two {
+		t.Errorf("mt.Add(2) != mt.Add(1).Add(1) (%#v != %#v)", one, two)
+	}
+
+	min := mt.Add(math.MinInt64)
+	max := mt.Add(math.MaxInt64)
+
+	if overflow := mt.Add(1).Add(math.MaxInt64); overflow != max {
+		t.Errorf("mt.Add(math.MaxInt64) != mt.Add(1).Add(math.MaxInt64) (%#v != %#v)", max, overflow)
+	}
+	if underflow := mt.Add(-1).Add(math.MinInt64); underflow != min {
+		t.Errorf("mt.Add(math.MinInt64) != mt.Add(-1).Add(math.MinInt64) (%#v != %#v)", min, underflow)
+	}
+
+	if got, want := min.Sub(min), time.Duration(0); want != got {
+		t.Errorf("got min.Sub(min) = %d, want %d", got, want)
+	}
+	if got, want := max.Sub(max), time.Duration(0); want != got {
+		t.Errorf("got max.Sub(max) = %d, want %d", got, want)
+	}
+
+	if overflow, want := max.Sub(min), time.Duration(math.MaxInt64); overflow != want {
+		t.Errorf("mt.Add(math.MaxInt64).Sub(mt.Add(math.MinInt64) != %s (%#v)", want, overflow)
+	}
+	if underflow, want := min.Sub(max), time.Duration(math.MinInt64); underflow != want {
+		t.Errorf("mt.Add(math.MinInt64).Sub(mt.Add(math.MaxInt64) != %s (%#v)", want, underflow)
+	}
+}
+
+func TestMonotonicTimeSub(t *testing.T) {
+	var mt tcpip.MonotonicTime
+
+	if one, two := mt.Add(2), mt.Add(1).Add(1); one != two {
+		t.Errorf("mt.Add(2) != mt.Add(1).Add(1) (%#v != %#v)", one, two)
+	}
+
+	if max, overflow := mt.Add(math.MaxInt64), mt.Add(1).Add(math.MaxInt64); max != overflow {
+		t.Errorf("mt.Add(math.MaxInt64) != mt.Add(1).Add(math.MaxInt64) (%#v != %#v)", max, overflow)
+	}
+	if max, underflow := mt.Add(math.MinInt64), mt.Add(-1).Add(math.MinInt64); max != underflow {
+		t.Errorf("mt.Add(math.MinInt64) != mt.Add(-1).Add(math.MinInt64) (%#v != %#v)", max, underflow)
+	}
+}
 
 const (
 	shortDuration  = 1 * time.Nanosecond
@@ -52,10 +129,14 @@ func TestJobReschedule(t *testing.T) {
 	wg.Wait()
 }
 
+func stdClockWithAfter() (tcpip.Clock, func(time.Duration) <-chan time.Time) {
+	return tcpip.NewStdClock(), time.After
+}
+
 func TestJobExecution(t *testing.T) {
 	t.Parallel()
 
-	clock := tcpip.NewStdClock()
+	clock, after := stdClockWithAfter()
 	var lock sync.Mutex
 	ch := make(chan struct{})
 
@@ -67,7 +148,7 @@ func TestJobExecution(t *testing.T) {
 	// Wait for timer to fire.
 	select {
 	case <-ch:
-	case <-time.After(middleDuration):
+	case <-after(middleDuration):
 		t.Fatal("timed out waiting for timer to fire")
 	}
 
@@ -75,14 +156,14 @@ func TestJobExecution(t *testing.T) {
 	select {
 	case <-ch:
 		t.Fatal("no other timers should have fired")
-	case <-time.After(middleDuration):
+	case <-after(middleDuration):
 	}
 }
 
 func TestCancellableTimerResetFromLongDuration(t *testing.T) {
 	t.Parallel()
 
-	clock := tcpip.NewStdClock()
+	clock, after := stdClockWithAfter()
 	var lock sync.Mutex
 	ch := make(chan struct{})
 
@@ -98,7 +179,7 @@ func TestCancellableTimerResetFromLongDuration(t *testing.T) {
 	// Wait for timer to fire.
 	select {
 	case <-ch:
-	case <-time.After(middleDuration):
+	case <-after(middleDuration):
 		t.Fatal("timed out waiting for timer to fire")
 	}
 
@@ -106,14 +187,14 @@ func TestCancellableTimerResetFromLongDuration(t *testing.T) {
 	select {
 	case <-ch:
 		t.Fatal("no other timers should have fired")
-	case <-time.After(middleDuration):
+	case <-after(middleDuration):
 	}
 }
 
 func TestJobRescheduleFromShortDuration(t *testing.T) {
 	t.Parallel()
 
-	clock := tcpip.NewStdClock()
+	clock, after := stdClockWithAfter()
 	var lock sync.Mutex
 	ch := make(chan struct{})
 
@@ -127,7 +208,7 @@ func TestJobRescheduleFromShortDuration(t *testing.T) {
 	select {
 	case <-ch:
 		t.Fatal("timer fired after being stopped")
-	case <-time.After(middleDuration):
+	case <-after(middleDuration):
 	}
 
 	job.Schedule(shortDuration)
@@ -135,7 +216,7 @@ func TestJobRescheduleFromShortDuration(t *testing.T) {
 	// Wait for timer to fire.
 	select {
 	case <-ch:
-	case <-time.After(middleDuration):
+	case <-after(middleDuration):
 		t.Fatal("timed out waiting for timer to fire")
 	}
 
@@ -143,14 +224,14 @@ func TestJobRescheduleFromShortDuration(t *testing.T) {
 	select {
 	case <-ch:
 		t.Fatal("no other timers should have fired")
-	case <-time.After(middleDuration):
+	case <-after(middleDuration):
 	}
 }
 
 func TestJobImmediatelyCancel(t *testing.T) {
 	t.Parallel()
 
-	clock := tcpip.NewStdClock()
+	clock, after := stdClockWithAfter()
 	var lock sync.Mutex
 	ch := make(chan struct{})
 
@@ -166,14 +247,19 @@ func TestJobImmediatelyCancel(t *testing.T) {
 	select {
 	case <-ch:
 		t.Fatal("timer fired after being stopped")
-	case <-time.After(middleDuration):
+	case <-after(middleDuration):
 	}
+}
+
+func stdClockWithAfterAndSleep() (tcpip.Clock, func(time.Duration) <-chan time.Time, func(time.Duration)) {
+	clock, after := stdClockWithAfter()
+	return clock, after, time.Sleep
 }
 
 func TestJobCancelledRescheduleWithoutLock(t *testing.T) {
 	t.Parallel()
 
-	clock := tcpip.NewStdClock()
+	clock, after, sleep := stdClockWithAfterAndSleep()
 	var lock sync.Mutex
 	ch := make(chan struct{})
 
@@ -188,7 +274,7 @@ func TestJobCancelledRescheduleWithoutLock(t *testing.T) {
 
 		lock.Lock()
 		// Sleep until the timer fires and gets blocked trying to take the lock.
-		time.Sleep(middleDuration * 2)
+		sleep(middleDuration * 2)
 		job.Cancel()
 		lock.Unlock()
 	}
@@ -198,14 +284,14 @@ func TestJobCancelledRescheduleWithoutLock(t *testing.T) {
 	select {
 	case <-ch:
 		t.Fatal("timer fired after being stopped")
-	case <-time.After(middleDuration * 2):
+	case <-after(middleDuration * 2):
 	}
 }
 
 func TestManyCancellableTimerResetAfterBlockedOnLock(t *testing.T) {
 	t.Parallel()
 
-	clock := tcpip.NewStdClock()
+	clock, after, sleep := stdClockWithAfterAndSleep()
 	var lock sync.Mutex
 	ch := make(chan struct{})
 
@@ -214,7 +300,7 @@ func TestManyCancellableTimerResetAfterBlockedOnLock(t *testing.T) {
 	job.Schedule(shortDuration)
 	for i := 0; i < 10; i++ {
 		// Sleep until the timer fires and gets blocked trying to take the lock.
-		time.Sleep(middleDuration)
+		sleep(middleDuration)
 		job.Cancel()
 		job.Schedule(shortDuration)
 	}
@@ -223,7 +309,7 @@ func TestManyCancellableTimerResetAfterBlockedOnLock(t *testing.T) {
 	// Wait for double the duration for the last timer to fire.
 	select {
 	case <-ch:
-	case <-time.After(middleDuration):
+	case <-after(middleDuration):
 		t.Fatal("timed out waiting for timer to fire")
 	}
 
@@ -231,14 +317,14 @@ func TestManyCancellableTimerResetAfterBlockedOnLock(t *testing.T) {
 	select {
 	case <-ch:
 		t.Fatal("no other timers should have fired")
-	case <-time.After(middleDuration):
+	case <-after(middleDuration):
 	}
 }
 
 func TestManyJobReschedulesUnderLock(t *testing.T) {
 	t.Parallel()
 
-	clock := tcpip.NewStdClock()
+	clock, after := stdClockWithAfter()
 	var lock sync.Mutex
 	ch := make(chan struct{})
 
@@ -254,7 +340,7 @@ func TestManyJobReschedulesUnderLock(t *testing.T) {
 	// Wait for double the duration for the last timer to fire.
 	select {
 	case <-ch:
-	case <-time.After(middleDuration):
+	case <-after(middleDuration):
 		t.Fatal("timed out waiting for timer to fire")
 	}
 
@@ -262,6 +348,6 @@ func TestManyJobReschedulesUnderLock(t *testing.T) {
 	select {
 	case <-ch:
 		t.Fatal("no other timers should have fired")
-	case <-time.After(middleDuration):
+	case <-after(middleDuration):
 	}
 }

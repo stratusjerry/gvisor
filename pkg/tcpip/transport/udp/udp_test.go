@@ -16,7 +16,6 @@ package udp_test
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"io/ioutil"
 	"math/rand"
@@ -27,6 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/checker"
+	"gvisor.dev/gvisor/pkg/tcpip/faketime"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 	"gvisor.dev/gvisor/pkg/tcpip/link/loopback"
@@ -290,6 +290,7 @@ func (flow testFlow) isReverseMulticast() bool {
 type testContext struct {
 	t      *testing.T
 	linkEP *channel.Endpoint
+	clock  *faketime.ManualClock
 	s      *stack.Stack
 
 	ep tcpip.Endpoint
@@ -298,16 +299,19 @@ type testContext struct {
 
 func newDualTestContext(t *testing.T, mtu uint32) *testContext {
 	t.Helper()
-	return newDualTestContextWithOptions(t, mtu, stack.Options{
-		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
-		TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4},
-		HandleLocal:        true,
-	})
+	return newDualTestContextWithHandleLocal(t, mtu, true)
 }
 
-func newDualTestContextWithOptions(t *testing.T, mtu uint32, options stack.Options) *testContext {
+func newDualTestContextWithHandleLocal(t *testing.T, mtu uint32, handleLocal bool) *testContext {
 	t.Helper()
 
+	clock := faketime.NewManualClock()
+	options := stack.Options{
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4},
+		HandleLocal:        handleLocal,
+		Clock:              clock,
+	}
 	s := stack.New(options)
 	ep := channel.New(256, mtu, "")
 	wep := stack.LinkEndpoint(ep)
@@ -341,6 +345,7 @@ func newDualTestContextWithOptions(t *testing.T, mtu uint32, options stack.Optio
 	return &testContext{
 		t:      t,
 		s:      s,
+		clock:  clock,
 		linkEP: ep,
 	}
 }
@@ -378,9 +383,8 @@ func (c *testContext) createEndpointForFlow(flow testFlow) {
 func (c *testContext) getPacketAndVerify(flow testFlow, checkers ...checker.NetworkChecker) []byte {
 	c.t.Helper()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	p, ok := c.linkEP.ReadContext(ctx)
+	c.clock.Advance(2 * time.Second)
+	p, ok := c.linkEP.Read()
 	if !ok {
 		c.t.Fatalf("Packet wasn't written out")
 		return nil
@@ -606,7 +610,7 @@ func testReadInternal(c *testContext, flow testFlow, packetShouldBeDropped, expe
 		case <-ch:
 			res, err = c.ep.Read(&buf, tcpip.ReadOptions{NeedRemoteAddr: true})
 
-		case <-time.After(300 * time.Millisecond):
+		default:
 			if packetShouldBeDropped {
 				return // expected to time out
 			}
@@ -820,11 +824,7 @@ func TestV4ReadSelfSource(t *testing.T) {
 		{"NoHandleLocal", true, &tcpip.ErrWouldBlock{}, 1},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			c := newDualTestContextWithOptions(t, defaultMTU, stack.Options{
-				NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
-				TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
-				HandleLocal:        tt.handleLocal,
-			})
+			c := newDualTestContextWithHandleLocal(t, defaultMTU, tt.handleLocal)
 			defer c.cleanup()
 
 			c.createEndpointForFlow(unicastV4)
@@ -1036,9 +1036,9 @@ func testWriteAndVerifyInternal(c *testContext, flow testFlow, setDest bool, che
 	b := c.getPacketAndVerify(flow, checkers...)
 	var udp header.UDP
 	if flow.isV4() {
-		udp = header.UDP(header.IPv4(b).Payload())
+		udp = header.IPv4(b).Payload()
 	} else {
-		udp = header.UDP(header.IPv6(b).Payload())
+		udp = header.IPv6(b).Payload()
 	}
 	if !bytes.Equal(payload, udp.Payload()) {
 		c.t.Fatalf("Bad payload: got %x, want %x", udp.Payload(), payload)
@@ -1198,7 +1198,7 @@ func TestWriteOnConnectedInvalidPort(t *testing.T) {
 			r.Reset(payload)
 			n, err := c.ep.Write(&r, writeOpts)
 			if err != nil {
-				c.t.Fatalf("c.ep.Write(...) = %+s, want nil", err)
+				c.t.Fatalf("c.ep.Write(...) = %s, want nil", err)
 			}
 			if got, want := n, int64(len(payload)); got != want {
 				c.t.Fatalf("c.ep.Write(...) wrote %d bytes, want %d bytes", got, want)
@@ -1889,18 +1889,16 @@ func TestV4UnknownDestination(t *testing.T) {
 				}
 			}
 			if !tc.icmpRequired {
-				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-				defer cancel()
-				if p, ok := c.linkEP.ReadContext(ctx); ok {
+				c.clock.Advance(time.Second)
+				if p, ok := c.linkEP.Read(); ok {
 					t.Fatalf("unexpected packet received: %+v", p)
 				}
 				return
 			}
 
 			// ICMP required.
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-			defer cancel()
-			p, ok := c.linkEP.ReadContext(ctx)
+			c.clock.Advance(time.Second)
+			p, ok := c.linkEP.Read()
 			if !ok {
 				t.Fatalf("packet wasn't written out")
 				return
@@ -1987,18 +1985,16 @@ func TestV6UnknownDestination(t *testing.T) {
 				}
 			}
 			if !tc.icmpRequired {
-				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-				defer cancel()
-				if p, ok := c.linkEP.ReadContext(ctx); ok {
+				c.clock.Advance(time.Second)
+				if p, ok := c.linkEP.Read(); ok {
 					t.Fatalf("unexpected packet received: %+v", p)
 				}
 				return
 			}
 
 			// ICMP required.
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-			defer cancel()
-			p, ok := c.linkEP.ReadContext(ctx)
+			c.clock.Advance(time.Second)
+			p, ok := c.linkEP.Read()
 			if !ok {
 				t.Fatalf("packet wasn't written out")
 				return

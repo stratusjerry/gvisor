@@ -172,9 +172,11 @@ func (f *packetsPendingLinkResolution) enqueue(r *Route, proto tcpip.NetworkProt
 	cancelledPackets := f.newCancelChannelLocked(ch)
 
 	if len(cancelledPackets) != 0 {
-		// Dequeue the pending packets in a new goroutine to not hold up the current
-		// goroutine as handing link resolution failures may be a costly operation.
-		go f.dequeuePackets(cancelledPackets, "" /* linkAddr */, &tcpip.ErrAborted{})
+		// Dequeue the pending packets asynchronously handing link resolution
+		// failures may be slow.
+		f.nic.stack.clock.AfterFunc(0, func() {
+			f.dequeuePackets(cancelledPackets, "" /* linkAddr */, &tcpip.ErrAborted{})
+		})
 	}
 
 	return pkt.len(), nil
