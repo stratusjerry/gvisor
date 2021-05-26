@@ -16,6 +16,7 @@ package tcp_syncookie_test
 
 import (
 	"flag"
+	"fmt"
 	"testing"
 	"time"
 
@@ -67,4 +68,66 @@ func TestTCPSynCookie(t *testing.T) {
 
 	t.Run("without syncookies", func(t *testing.T) { checkSynAck(t, &withoutSynCookieConn, true /*expectRetransmit*/) })
 	t.Run("with syncookies", func(t *testing.T) { checkSynAck(t, &withSynCookieConn, false /*expectRetransmit*/) })
+}
+
+// TestTCPSynCookieAck tests ACK handling for SYNRCVD state connections with
+// and without syncookies.
+func TestTCPSynCookieAck(t *testing.T) {
+	for _, tt := range []struct {
+		flags  header.TCPFlags
+		accept bool
+	}{
+		{flags: header.TCPFlagAck, accept: true},
+		{flags: header.TCPFlagAck | header.TCPFlagPsh, accept: true},
+		{flags: header.TCPFlagAck | header.TCPFlagSyn, accept: false},
+		{flags: header.TCPFlagAck | header.TCPFlagFin, accept: true},
+		{flags: header.TCPFlagAck | header.TCPFlagRst, accept: false},
+		{flags: header.TCPFlagRst, accept: false},
+	} {
+		t.Run(fmt.Sprintf("flags %s", tt.flags), func(t *testing.T) {
+			dut := testbench.NewDUT(t)
+
+			// Listening endpoint accepts one more connection than the listen backlog.
+			listenFD, remotePort := dut.CreateListener(t, unix.SOCK_STREAM, unix.IPPROTO_TCP, 1 /*backlog*/)
+
+			// Test if the DUT listener replies to more SYNs than listen backlog+1
+			withoutSynCookieConn := dut.Net.NewTCPIPv4(t, testbench.TCP{DstPort: &remotePort}, testbench.TCP{SrcPort: &remotePort})
+			defer withoutSynCookieConn.Close(t)
+			withSynCookieConn := dut.Net.NewTCPIPv4(t, testbench.TCP{DstPort: &remotePort}, testbench.TCP{SrcPort: &remotePort})
+			defer withSynCookieConn.Close(t)
+
+			// Bring both the connections to SYNRCVD state with one of them
+			// setup using syncookies.
+			for _, c := range []struct {
+				desc string
+				conn testbench.TCPIPv4
+			}{
+				{desc: "without syncookies", conn: withoutSynCookieConn},
+				{desc: "with syncookies", conn: withSynCookieConn},
+			} {
+				c.conn.Send(t, testbench.TCP{Flags: testbench.TCPFlags(header.TCPFlagSyn)})
+				if _, err := c.conn.ExpectData(t, &testbench.TCP{Flags: testbench.TCPFlags(header.TCPFlagSyn | header.TCPFlagAck)}, nil, time.Second); err != nil {
+					t.Fatalf("%s expected SYN-ACK, but got %s", c.desc, err)
+				}
+			}
+
+			// Check whether ACKs with the given flags completes the handshake.
+			for _, c := range []struct {
+				desc string
+				conn testbench.TCPIPv4
+			}{
+				{desc: "without syncookies", conn: withoutSynCookieConn},
+				{desc: "with syncookies", conn: withSynCookieConn},
+			} {
+				c.conn.Send(t, testbench.TCP{Flags: testbench.TCPFlags(tt.flags)})
+				pfds := dut.Poll(t, []unix.PollFd{{Fd: listenFD, Events: unix.POLLIN}}, time.Second)
+				if tt.accept && len(pfds) != 1 {
+					t.Fatalf("%s dut.Poll(...) = %v", c.desc, pfds)
+				}
+				if !tt.accept && len(pfds) != 0 {
+					t.Fatalf("%s dut.Poll(...) = %v", c.desc, pfds)
+				}
+			}
+		})
+	}
 }

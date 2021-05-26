@@ -611,7 +611,10 @@ func (e *endpoint) handleListenSegment(ctx *listenContext, s *segment) tcpip.Err
 		e.stack.Stats().TCP.ListenOverflowSynCookieSent.Increment()
 		return nil
 
-	case (s.flags & header.TCPFlagAck) != 0:
+	case s.flagIsSet(header.TCPFlagRst):
+		return nil
+
+	case s.flagIsSet(header.TCPFlagAck):
 		if e.acceptQueueIsFull() {
 			// Silently drop the ack as the application can't accept
 			// the connection at this point. The ack will be
